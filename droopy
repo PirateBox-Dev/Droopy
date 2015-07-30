@@ -74,6 +74,8 @@ import socket
 import locale
 import urllib
 import base64
+import string
+from pickle import load,dump
 from ctypes import CDLL, c_char_p
 
 LOGO = '''\
@@ -112,6 +114,27 @@ publish_files = False
 auth = None
 certfile = None
 file_mode = None
+
+## User supplied subdirectory stuff
+userdirs= False # disabled by default, overridden by command line
+# where to store the password file for users
+#password_file='/opt/piratebox/passwd'
+password_file='/tmp/passwd'
+# What name will be used if subdir isn't specified
+# must be lower case
+anondir="anonymous"
+# If no subdir is specified, put in root (0), or anondir(1)?
+useAnondir=1
+
+userdirform='''
+<br><A HREF="javascript:show('advanced_fields')">%(advanced)s</a>
+<div height="150px" class="box">
+<fieldset id="advanced_fields" style="hidden:true;display:none">
+<br>%(userdirname)s <input name="subdir" type="textbox">
+<p>%(userdirpassword)s <input name="secret" type="textbox">
+</fieldset>
+</div>
+'''
 
 # -- HTML templates
 
@@ -188,6 +211,10 @@ function onunload() {
    document.getElementById("form").style.display = "block";
    document.getElementById("sending").style.display = "none";
 }
+function show(elem_id) {
+    elem = document.getElementById(elem_id);
+    if (elem) elem.style.display = 'block';
+}
 </script></head>
 <body>
 %(linkurl)s
@@ -197,8 +224,10 @@ function onunload() {
     <form method="post" enctype="multipart/form-data" action="">
       <input name="upfile" type="file" multiple="yes">
       <input value="%(submit)s" onclick="swap()" type="submit">
-    </form>
+    %(userdiropts)s      
+    </form>    
   </div>
+          
   <div id="sending" class="box">
     <table id="progress">
       <tr>
@@ -329,7 +358,12 @@ en = {"maintitle":       "Send a file",
       "errortitle":      "Problem",
       "problem":         "There has been a problem!",
       "retry":           "Retry.",
-      "discover":        "Discover the address of this page"}
+      "discover":        "Discover the address of this page",
+      "subdirerror":          "There is a problem uploading to that subdirectory.<br> Check if that subdirectory already exits.<br> If it does not, make sure you are only using characters a-zA-Z0-9 for the username and password. <br>If the directory exists and the characters are valid, you probably are using the wrong password<p>",
+      "advanced":	 "advanced options",
+      "userdirname":     "Name of directory to place files in ",
+      "userdirpassword": "Password for saving files to that directory (optional)"
+      }
 
 es = {"maintitle":       u"Enviar un archivo",
       "submit":          u"Enviar",
@@ -616,7 +650,64 @@ class HTTPUploadHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     divpicture = '<div class="box"><img src="/__droopy/picture"/></div>'
 
 
-    def html(self, page):
+    def _safername(self,name):
+        """ Checking whether we can make a directory-name out of this name
+        Thanks to stackoverflow, Vinko Vrsalovic 
+        """
+        valid_chars = frozenset("-_() %s%s" % (string.letters, string.digits))
+        name2 = ''.join(c for c in name if c in valid_chars)
+        if len(name) == 0:
+                return anondir
+        if name2 == name:
+                return name.encode('utf8')
+        else:
+                print('WARNING: name too complex; try %s'%name2)
+        return False
+
+
+    def _mkuserpath(self,userdir,filename):
+       mydir = directory + "/" + userdir
+       if (os.path.exists(mydir)):
+          localpath = os.path.join(mydir, filename).encode('utf-8')
+       else:
+          try:
+             os.mkdir(mydir)
+          except IOError:
+             print ("can't make directory")
+          else:
+             localpath = os.path.join(mydir, filename).encode('utf-8')
+       return localpath
+
+    def _login(self,subdir, passwd ):
+       """ Allow user to provide subdirectory & write access password. 
+           This offers little security, but helps organization 
+           returns success,NAME
+       """
+       name = self._safername( subdir.lower() )
+       password = passwd  #safename( passwd )
+       
+       if (name == "" or name == anondir) :
+          return (True, anondir ) # don't let people set password on anon
+       try:
+          pairs = load(open(password_file))
+       except IOError:
+          print('WARNING: No password file found. Starting from scratch.')
+          pairs = {}
+       if name in pairs:
+          if pairs[name] == password:
+             return True,name
+          else:
+             print('ERROR: wrong password')
+             return False,"BadPassword"
+       else:
+          print('INFO: Adding subdir %s to the system'%name)
+          pairs[name] = password
+          dump(pairs, open(password_file, 'w'))
+          return True,name
+
+
+
+    def html(self, page, errormsg=""):
         """
         page can be "main", "success", or "error"
         returns an html page (in the appropriate language) as a string
@@ -674,6 +765,16 @@ class HTTPUploadHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             dico["linkurl"] =  linkurltmpl % dico
         else:
             dico["linkurl"] = ""
+
+        if (userdirs == True):
+            dico["userdiropts"]  = userdirform % dico
+        else:
+            dico["userdiropts"]  = ''
+
+        dico["problem"] = ""
+        if (errormsg != ""):
+               if dico[errormsg]:
+                      dico["problem"]=dico[errormsg]
 
         return templates[page] % dico
 
@@ -733,6 +834,25 @@ class HTTPUploadHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 filename = self.basename(item.filename).decode('utf-8')
                 if filename == "":
                     continue
+
+                localpath =''
+                if (userdirs == True ):
+                   subdir = form['subdir'].value
+                   passwd = form['secret'].value
+                   success,userdir=self._login(subdir, passwd )
+                   if success == False:
+                      self.send_html(self.html("error","subdirerror"))
+                      #os.unlink(fileitem.tmpfilename)
+                      return
+                   else:
+                      if (userdir == anondir or userdir == ''):
+                         if ( useAnondir == 0):
+                            localpath = None
+                         else:
+                            localpath=self._mkuserpath(anondir,filename)
+                      else:
+                         localpath=self._mkuserpath(userdir,filename)
+
 
                 localpath = os.path.join(directory, filename).encode('utf-8')
                 root, ext = os.path.splitext(localpath)
@@ -840,9 +960,9 @@ def configfile():
     appname = 'droopy'
     # os.name is 'posix', 'nt', 'os2', 'mac', 'ce' or 'riscos'
     if os.name == 'posix':
-	    getenv = CDLL("libc.so.6").getenv
-	    getenv.restype = c_char_p
-	    filename = "%s/.%s" % (getenv("HOME"), appname)
+         getenv = CDLL("libc.so.6").getenv
+         getenv.restype = c_char_p
+         filename = "%s/.%s" % (getenv("HOME"), appname)
 
     elif os.name == 'mac':
          filename = ("%s/Library/Application Support/%s" %
@@ -899,6 +1019,7 @@ def parse_args(cmd=None):
     """
     global picture, message, port, directory, must_save_options, publish_files
     global auth, certfile, file_mode
+    global userdirs
 
     if cmd == None:
         cmd = sys.argv[1:]
@@ -908,9 +1029,9 @@ def parse_args(cmd=None):
 
     opts, args = None, None
     try:
-        opts, args = getopt.gnu_getopt(cmd, "p:m:d:a:h",
+        opts, args = getopt.gnu_getopt(cmd, "p:m:d:a:u:h",
                                        ["picture=","message=", "directory=",
-                                        "auth=", "ssl=", "chmod=", "help",
+                                        "auth=", "ssl=", "chmod=", "help", "userdirs",
                                         "save-config", "delete-config", "dl"])
     except Exception, e:
         print e
@@ -928,6 +1049,10 @@ def parse_args(cmd=None):
 
         elif o in ['-d', '--directory']:
             directory = fullpath(a)
+
+        elif o in ["-u", "--userdirs" ] :
+            userdirs = True
+            print "userdirs are %s" %userdirs
 
         elif o in ['--save-config']:
             must_save_options = True
